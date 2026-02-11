@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+pandas
+langchain
+langchain-openai
+pypdf
+python-multipart
+python-dotenv
+openpyxl  # pandas 读 excel 需要它
+langchain-community
+langchain-huggingface # 用来做向量化
+langchain-chroma
+langchain-experimental
+tabulate
+chromadb  # 向量数据库
+sentence-transformers # 开源的 embedding 模型
