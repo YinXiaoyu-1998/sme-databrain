@@ -57,6 +57,28 @@ GLOBAL_CONTEXT = {
     "current_file": None  # record the current loaded file name
 }
 
+def format_chat_history(history: Optional[list], limit: int = 6) -> str:
+    if not history or not isinstance(history, list):
+        return ""
+
+    items_sorted = sorted(history, key=lambda x: x.get("createdAt", ""))
+    last_chat_id = items_sorted[-1].get("chatId")
+    if last_chat_id:
+        items_sorted = [item for item in items_sorted if item.get("chatId") == last_chat_id]
+
+    items_sorted = items_sorted[-limit:]
+    lines = []
+    for item in items_sorted:
+        role = item.get("role", "")
+        content = item.get("content", "")
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"用户: {content}")
+        else:
+            lines.append(f"助手: {content}")
+    return "\n".join(lines).strip()
+
 def custom_error_handler(error: Exception) -> str:
     error_str = str(error)
     
@@ -83,6 +105,7 @@ class LoadContextRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     message: str # 用户的问题
+    history: Optional[list] = None
 
 @app.get("/")
 def read_root():
@@ -188,6 +211,9 @@ async def chat(request: ChatRequest):
     """
     question = request.message
     current_type = GLOBAL_CONTEXT["current_file"]
+    history_text = format_chat_history(request.history)
+    if history_text:
+        question = f"对话历史（仅供参考）：\n{history_text}\n\n当前问题：{question}"
 
     if not current_type:
         return {"answer": "🧠 大脑空空如也。请先在左侧上传一个文件。"}
@@ -235,6 +261,10 @@ async def chat(request: ChatRequest):
             你是一个企业助手。请根据下面的上下文回答用户的问题。
             如果上下文中没有答案，就诚实地说不知道，不要编造。
             
+            <history>
+            {history}
+            </history>
+
             <context>
             {context}
             </context>
@@ -247,7 +277,7 @@ async def chat(request: ChatRequest):
             retrieval_chain = create_retrieval_chain(retriever, document_chain)
 
             # 执行问答
-            response = retrieval_chain.invoke({"input": question})
+            response = retrieval_chain.invoke({"input": question, "history": history_text or "无"})
             return {"answer": response["answer"]}
 
     except Exception as e:
