@@ -1,0 +1,32 @@
+---
+description: Prefer object parameters over positional parameters
+alwaysApply: true
+---
+
+# Function Parameter Style
+
+When a function needs multiple inputs, prefer a single object parameter instead of positional parameters.
+
+Use this especially when:
+- the function has 2 or more parameters
+- parameters have the same or similar types
+- parameters are optional now or may grow later
+
+Single, simple primitive parameters are allowed.
+
+```typescript
+// ❌ BAD: positional parameters are easier to mix up
+function createUser(name: string, age: number) {
+  // ...
+}
+
+// ✅ GOOD: named fields are explicit and extensible
+function createUser({ name, age }: { name: string; age: number }) {
+  // ...
+}
+
+// ✅ ALLOWED: simple single-argument function
+function getUserById(userId: string) {
+  // ...
+}
+```

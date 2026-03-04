@@ -1,290 +1,516 @@
 
+import logging
 import os
-from typing import Optional
+import time
+import uuid
+import json
+from typing import Any
+
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-import pandas as pd
-import re
-# LangChain related library
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_experimental.agents.agent_toolkits import create_pandas_dataframe_agent
-from langchain_classic.chains import create_retrieval_chain
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import HumanMessage, ToolMessage
 from dotenv import load_dotenv
 
-app = FastAPI(title="SME Data Brain", version="0.0.1")
+from schemas import LoadContextRequest, ChatRequest
+from utils import (
+    chunk_excel_file,
+    file_sha256,
+    format_chat_history,
+    get_db_connection,
+    ingest_structured_data,
+    is_excel_mime,
+    read_excel_workbook,
+    vector_to_literal,
+)
+from tools import build_tools
 
-# ==========================================
-# Configuration area
-# ==========================================
-# Load .env so os.getenv can see GEMINI_API_KEY
+app = FastAPI(title="SME Data Brain", version="0.2.0")
+logger = logging.getLogger("sme-databrain")
+logging.basicConfig(level=logging.INFO)
+
 load_dotenv()
-# Use environment variable to store the API key
-# os.environ["GOOGLE_API_KEY"] = os.getenv("GEMINI_API_KEY")
 
-# ==========================================
-# 🚑 网络急救包 (新增部分)
-# ==========================================
-# 强制 Python 的请求走 VPN 代理
-# 请根据你的实际情况修改端口号 (比如 7890 或 7897)
-os.environ["http_proxy"] = "http://127.0.0.1:7897"
-os.environ["https_proxy"] = "http://127.0.0.1:7897"
-
-# Initialize LLM
 llm = ChatGoogleGenerativeAI(
-    # model="gemini-2.5-flash-lite", # gemini-2.5-flash-lite, gemini-3-pro-preview
-    model="gemini-3-pro-preview",
+    model="gemini-2.5-pro",
+    # model="gemini-3-pro-preview",
+    # model="gemini-pro-latest",
     temperature=0,
     max_retries=2,
-    transport="rest", # If you encounter SSL errors, try uncommenting this line
+    transport="rest",
 )
 
-# ==========================================
-# 🧠 Global brain status (MVP core)
-# ==========================================
-# load the file into memory for this MVP.
-# data will be lost after restart, but it's acceptable for this MVP.
-GLOBAL_CONTEXT = {
-    "df": None,           # store Excel DataFrame
-    "vector_store": None, # store PDF vector store (Chroma)
-    "current_file": None  # record the current loaded file name
-}
+embedding_model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+embedding_function = HuggingFaceEmbeddings(model_name=embedding_model_name)
 
-def format_chat_history(history: Optional[list], limit: int = 6) -> str:
-    if not history or not isinstance(history, list):
-        return ""
+max_excel_file_mb = int(os.getenv("MAX_EXCEL_FILE_MB", "25"))
+max_rows_per_sheet = int(os.getenv("MAX_ROWS_PER_SHEET", "10000"))
+chunk_size = int(os.getenv("EXCEL_CHUNK_SIZE", "40"))
+chunk_overlap = int(os.getenv("EXCEL_CHUNK_OVERLAP", "8"))
 
-    items_sorted = sorted(history, key=lambda x: x.get("createdAt", ""))
-    last_chat_id = items_sorted[-1].get("chatId")
-    if last_chat_id:
-        items_sorted = [item for item in items_sorted if item.get("chatId") == last_chat_id]
 
-    items_sorted = items_sorted[-limit:]
-    lines = []
-    for item in items_sorted:
-        role = item.get("role", "")
-        content = item.get("content", "")
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"用户: {content}")
-        else:
-            lines.append(f"助手: {content}")
-    return "\n".join(lines).strip()
+def extract_llm_text(response: object) -> str:
+    content = getattr(response, "content", response)
+    if isinstance(content, str):
+        return content.strip()
 
-def custom_error_handler(error: Exception) -> str:
-    error_str = str(error)
-    
-    # 模式匹配：匹配 "Could not parse LLM output: `" 之后的所有内容
-    # (.*) 是捕获组
-    # re.DOTALL 意思是让点号 (.) 也能匹配换行符，这对于长篇分析很重要
-    match = re.search(r"Could not parse LLM output: `(.*)`", error_str, re.DOTALL)
-    
-    if match:
-        # group(1) 拿到的就是反引号包裹的完整内容（无论里面有没有嵌套反引号）
-        # strip("`") 是为了保险起见，去掉可能残留在末尾的包裹符号
-        return match.group(1).strip("`")
-    
-    # 处理 Action 缺失的备用逻辑
-    if "Invalid Format: Missing 'Action:'" in error_str:
-        return "分析已完成，但格式稍有偏差。请尝试在 Prompt 中强调只输出结论。"
-        
-    return str(error)
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                text = item.strip()
+                if text:
+                    parts.append(text)
+                continue
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    text = text.strip()
+                    if text:
+                        parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
 
-# define the request body structure
-class LoadContextRequest(BaseModel):
-    filepath: str
-    mimeType: str
+    return str(content).strip()
 
-class ChatRequest(BaseModel):
-    message: str # 用户的问题
-    history: Optional[list] = None
+
+def fetch_generated_files(file_ids: list[str]) -> list[dict]:
+    if not file_ids:
+        return []
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT "id", "fileType", "mimeType", "filename", "path", "size"
+                FROM "GeneratedFile"
+                WHERE "id" = ANY(%s)
+                """,
+                (file_ids,),
+            )
+            rows = cursor.fetchall()
+    return [
+        {
+            "id": row[0],
+            "fileType": row[1],
+            "mimeType": row[2],
+            "filename": row[3],
+            "path": row[4],
+            "size": row[5],
+        }
+        for row in rows
+    ]
+
+
+def build_data_catalog(*, user_id: str, file_id: str | None) -> tuple[str, list[str]]:
+    """Build a compact data catalog string for the LLM prompt.
+
+    Returns (catalog_text, user_file_ids).
+    """
+    with get_db_connection() as conn:
+        with conn.cursor() as cursor:
+            if file_id:
+                cursor.execute(
+                    """
+                    SELECT sm."fileId", f."originalName", sm."sheetName",
+                           sm."columns", sm."columnTypes", sm."rowCount",
+                           sm."sampleValues"
+                    FROM "SheetMeta" sm
+                    JOIN "DataFile" f ON f."id" = sm."fileId"
+                    WHERE sm."userId" = %s AND sm."fileId" = %s
+                    ORDER BY f."originalName", sm."sheetName"
+                    """,
+                    (user_id, file_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT sm."fileId", f."originalName", sm."sheetName",
+                           sm."columns", sm."columnTypes", sm."rowCount",
+                           sm."sampleValues"
+                    FROM "SheetMeta" sm
+                    JOIN "DataFile" f ON f."id" = sm."fileId"
+                    WHERE sm."userId" = %s
+                    ORDER BY f."originalName", sm."sheetName"
+                    """,
+                    (user_id,),
+                )
+            rows = cursor.fetchall()
+
+    if not rows:
+        return "", []
+
+    files: dict[str, dict[str, Any]] = {}
+    user_file_ids: list[str] = []
+    for row in rows:
+        fid, fname, sheet_name, columns, col_types, row_count, sample_values = row
+        if fid not in files:
+            files[fid] = {"name": fname, "sheets": []}
+            user_file_ids.append(fid)
+
+        col_types = col_types or {}
+        sample_values = sample_values or {}
+        col_descs = []
+        for col in columns:
+            ctype = col_types.get(col, "text")
+            samples = sample_values.get(col, [])
+            sample_str = ""
+            if samples:
+                previews = [str(s) for s in samples[:2]]
+                sample_str = f', 例: {", ".join(previews)}'
+            col_descs.append(f"{col}({ctype}{sample_str})")
+
+        files[fid]["sheets"].append(
+            f'  Sheet "{sheet_name}" ({row_count}行): {", ".join(col_descs)}'
+        )
+
+    lines: list[str] = []
+    for fid, info in files.items():
+        lines.append(f'文件: "{info["name"]}" (fileId: {fid})')
+        lines.extend(info["sheets"])
+
+    return "\n".join(lines), user_file_ids
+
 
 @app.get("/")
 def read_root():
     return {"status": "SME DataBrain is running"}
 
+
+# =========================================================================
+# Ingestion endpoint
+# =========================================================================
+
 @app.post("/context/load")
 async def load_context(request: LoadContextRequest):
-    """
-    receive the file path from NestJS, and load it into memory.
-    """
-    file_path = request.filepath
-    mime_type = request.mimeType
-    
-    # 1. check if the file exists
+    print(request)
+    print("--------------------------------")
+    file_path = request.filepath.strip()
+    mime_type = request.mimeType.strip()
+    file_id = request.fileId.strip()
+
+    if not file_id:
+        raise HTTPException(status_code=400, detail="fileId is required")
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=f"File not found at {file_path}")
+    if not is_excel_mime(mime_type):
+        raise HTTPException(status_code=400, detail="Only Excel ingestion is enabled in this release")
+    if os.path.getsize(file_path) > max_excel_file_mb * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Excel file exceeds max size of {max_excel_file_mb}MB",
+        )
+
+    start = time.perf_counter()
+    document_id: str | None = None
+    ingestion_run_id: str | None = None
 
     try:
-        # ==========================================
-        # branch A: process Excel (for data analysis)
-        # ==========================================
-        if "spreadsheet" in mime_type or "excel" in mime_type:
-            print(f"📊 Loading Excel: {file_path}")
-            # read Excel to Pandas DataFrame
-            df = pd.read_excel(file_path)
+        content_hash = file_sha256(file_path)
+        workbook = read_excel_workbook(file_path, max_rows_per_sheet)
+        chunks = chunk_excel_file(
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            max_rows_per_sheet=max_rows_per_sheet,
+            workbook=workbook,
+        )
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Excel file does not contain readable rows")
 
-            # replace all NaN (empty values) with empty string ""
-            # so that FastAPI can convert it into JSON normally
-            df = df.fillna("") 
-            # ================================
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # Look up userId from DataFile
+                cursor.execute(
+                    'SELECT "userId" FROM "DataFile" WHERE "id" = %s',
+                    (file_id,),
+                )
+                file_owner = cursor.fetchone()
+                owner_user_id = file_owner[0] if file_owner else ""
 
-            # update the global context
-            GLOBAL_CONTEXT["df"] = df
-            GLOBAL_CONTEXT["vector_store"] = None # clear the previous PDF context
-            GLOBAL_CONTEXT["current_file"] = "excel"
-            
-            # return the summary of the data (column names and first few rows)
-            return {
-                "message": "Excel loaded successfully",
-                "type": "excel",
-                "columns": df.columns.tolist(),
-                "row_count": len(df),
-                "preview": df.head(3).to_dict()
-            }
+                cursor.execute(
+                    """
+                    SELECT "id", "contentHash", "status", "chunkCount"
+                    FROM "Document"
+                    WHERE "fileId" = %s
+                    """,
+                    (file_id,),
+                )
+                existing = cursor.fetchone()
 
-        # ==========================================
-        # branch B: process PDF (for RAG question answering)
-        # ==========================================
-        elif "pdf" in mime_type:
-            print(f"📄 Loading PDF: {file_path}")
-            
-            # 1. read the PDF text
-            loader = PyPDFLoader(file_path)
-            pages = loader.load()
-            
-            # 2. split the text (Chunking)
-            # key point of RAG: split the big book into small pieces, so that it's easier to retrieve.
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=500, # each chunk is 500 characters
-                chunk_overlap=50 # overlap 50 characters, to prevent context断裂
-            )
-            splits = text_splitter.split_documents(pages)
-            
-            # 3. vectorize and store (Embeddings & Storage)
-            # we use the local model (HuggingFace) here, which is completely free, and doesn't require OpenAI Key
-            # *careful*: the first time running will automatically download the model (about 100MB), which might be slow.
-            embedding_function = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-            
-            # create a temporary memory vector store
-            vector_store = Chroma.from_documents(
-                documents=splits,
-                embedding=embedding_function,
-                collection_name="sme_collection" # randomly named
-            )
-            
-            # update the global context
-            GLOBAL_CONTEXT["vector_store"] = vector_store
-            GLOBAL_CONTEXT["df"] = None
-            GLOBAL_CONTEXT["current_file"] = "pdf"
+                # Check if document is unchanged AND structured data exists
+                has_sheet_meta = False
+                if existing:
+                    cursor.execute(
+                        'SELECT COUNT(*) FROM "SheetMeta" WHERE "documentId" = %s',
+                        (existing[0],),
+                    )
+                    has_sheet_meta = (cursor.fetchone()[0] or 0) > 0
 
-            return {
-                "message": "PDF loaded and indexed successfully",
-                "type": "pdf",
-                "chunks_count": len(splits)
-            }
+                if (
+                    existing
+                    and existing[1] == content_hash
+                    and existing[2] == "COMPLETED"
+                    and int(existing[3] or 0) > 0
+                    and has_sheet_meta
+                ):
+                    duration_ms = int((time.perf_counter() - start) * 1000)
+                    ingestion_run_id = str(uuid.uuid4())
+                    cursor.execute(
+                        """
+                        INSERT INTO "RAGIngestionRun"
+                          ("id", "documentId", "fileId", "status", "chunksIndexed", "durationMs", "createdAt", "updatedAt", "completedAt")
+                        VALUES (%s, %s, %s, 'COMPLETED', 0, %s, NOW(), NOW(), NOW())
+                        """,
+                        (ingestion_run_id, existing[0], file_id, duration_ms),
+                    )
+                    conn.commit()
+                    return {
+                        "message": "Document unchanged; existing data reused",
+                        "fileId": file_id,
+                        "documentId": existing[0],
+                        "status": "SKIPPED",
+                        "chunksIndexed": int(existing[3] or 0),
+                    }
 
-        else:
-            raise HTTPException(status_code=400, detail="Unsupported file type")
+                if existing:
+                    document_id = existing[0]
+                    cursor.execute(
+                        """
+                        UPDATE "Document"
+                        SET "contentHash" = %s, "mimeType" = %s, "status" = 'PROCESSING',
+                            "chunkCount" = 0, "errorMessage" = NULL, "updatedAt" = NOW()
+                        WHERE "id" = %s
+                        """,
+                        (content_hash, mime_type, document_id),
+                    )
+                    cursor.execute('DELETE FROM "Chunk" WHERE "documentId" = %s', (document_id,))
+                else:
+                    document_id = str(uuid.uuid4())
+                    cursor.execute(
+                        """
+                        INSERT INTO "Document"
+                          ("id", "fileId", "contentHash", "status", "mimeType", "chunkCount", "createdAt", "updatedAt")
+                        VALUES (%s, %s, %s, 'PROCESSING', %s, 0, NOW(), NOW())
+                        """,
+                        (document_id, file_id, content_hash, mime_type),
+                    )
 
-    except Exception as e:
-        print(f"❌ Error loading file: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+                ingestion_run_id = str(uuid.uuid4())
+                cursor.execute(
+                    """
+                    INSERT INTO "RAGIngestionRun"
+                      ("id", "documentId", "fileId", "status", "chunksIndexed", "createdAt", "updatedAt")
+                    VALUES (%s, %s, %s, 'PROCESSING', 0, NOW(), NOW())
+                    """,
+                    (ingestion_run_id, document_id, file_id),
+                )
+
+                # --- Chunk + Embedding pipeline (existing) ---
+                vectors = embedding_function.embed_documents([item["content"] for item in chunks])
+                for idx, (chunk, vector) in enumerate(zip(chunks, vectors)):
+                    chunk_id = str(uuid.uuid4())
+                    cursor.execute(
+                        """
+                        INSERT INTO "Chunk" ("id", "documentId", "chunkIndex", "content", "metadata", "createdAt")
+                        VALUES (%s, %s, %s, %s, %s::jsonb, NOW())
+                        """,
+                        (
+                            chunk_id,
+                            document_id,
+                            idx,
+                            chunk["content"],
+                            json.dumps(chunk["metadata"], ensure_ascii=False),
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO "Embedding" ("id", "chunkId", "vector", "model", "createdAt")
+                        VALUES (%s, %s, %s::vector, %s, NOW())
+                        """,
+                        (str(uuid.uuid4()), chunk_id, vector_to_literal(vector), embedding_model_name),
+                    )
+
+                # --- Structured data pipeline (NEW) ---
+                structured_rows = ingest_structured_data(
+                    cursor,
+                    workbook=workbook,
+                    file_id=file_id,
+                    document_id=document_id,
+                    user_id=owner_user_id,
+                )
+                logger.info(
+                    "structured_data_ingested file_id=%s rows=%s",
+                    file_id, structured_rows,
+                )
+
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                cursor.execute(
+                    """
+                    UPDATE "Document"
+                    SET "status" = 'COMPLETED', "chunkCount" = %s, "processedAt" = NOW(), "updatedAt" = NOW()
+                    WHERE "id" = %s
+                    """,
+                    (len(chunks), document_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE "RAGIngestionRun"
+                    SET "status" = 'COMPLETED', "chunksIndexed" = %s, "durationMs" = %s, "updatedAt" = NOW(), "completedAt" = NOW()
+                    WHERE "id" = %s
+                    """,
+                    (len(chunks), duration_ms, ingestion_run_id),
+                )
+                conn.commit()
+
+                logger.info(
+                    "ingestion_completed file_id=%s document_id=%s chunks=%s structured_rows=%s duration_ms=%s",
+                    file_id, document_id, len(chunks), structured_rows, duration_ms,
+                )
+                return {
+                    "message": "Excel ingested and indexed successfully",
+                    "fileId": file_id,
+                    "documentId": document_id,
+                    "status": "COMPLETED",
+                    "chunksIndexed": len(chunks),
+                    "structuredRows": structured_rows,
+                }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("excel_ingestion_failed file_id=%s error=%s", file_id, str(exc))
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        try:
+            with get_db_connection() as conn:
+                with conn.cursor() as cursor:
+                    if document_id:
+                        cursor.execute(
+                            """
+                            UPDATE "Document"
+                            SET "status" = 'FAILED', "errorMessage" = %s, "updatedAt" = NOW()
+                            WHERE "id" = %s
+                            """,
+                            (str(exc), document_id),
+                        )
+                    if ingestion_run_id:
+                        cursor.execute(
+                            """
+                            UPDATE "RAGIngestionRun"
+                            SET "status" = 'FAILED', "errorMessage" = %s, "durationMs" = %s, "updatedAt" = NOW(), "completedAt" = NOW()
+                            WHERE "id" = %s
+                            """,
+                            (str(exc), duration_ms, ingestion_run_id),
+                        )
+                    conn.commit()
+        except Exception:
+            logger.exception("failed_to_update_ingestion_failure_status file_id=%s", file_id)
+        raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(exc)}")
 
 
-# {
-#   "message": "出 2025 年 9 月 26 号的销售数据，销量最好的产品是哪些？"
-# }
+# =========================================================================
+# Chat endpoint
+# =========================================================================
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
-    """
-    Core Chat Interface: based on the current context, answer the question intelligently
-    """
-    question = request.message
-    current_type = GLOBAL_CONTEXT["current_file"]
-    history_text = format_chat_history(request.history)
-    if history_text:
-        question = f"对话历史（仅供参考）：\n{history_text}\n\n当前问题：{question}"
+    question = request.message.strip()
+    user_id = request.userId.strip()
+    file_id = request.fileId.strip() if request.fileId else None
+    chat_id = request.chatId
 
-    if not current_type:
-        return {"answer": "🧠 大脑空空如也。请先在左侧上传一个文件。"}
+    if not question:
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+    if not user_id:
+        raise HTTPException(status_code=400, detail="userId is required")
+
+    history_text = format_chat_history(request.history)
 
     try:
-        # === Scenario A: Excel data analysis ===
-        if current_type == "excel":
-            df = GLOBAL_CONTEXT["df"]
-            my_instruction = """
-            你是一个经验丰富的营销分析师，
-            注意如下事项：
-            0. 严格使用中文回答问题。
-            1. 严格根据所提供的数据回答问题，如果提供的数据不能回答相关问题，请直说，或是要求提供相关数据，不要编造数据。
-            2. 你的回答必须严格遵守格式：
-                - 如果你要写代码，请使用 Action: python_repl_ast
-                - 如果你已经有了分析结果，**必须**以 "Final Answer:" 开头，然后写你的分析。
-            3. 不要只输出 Thought 而没有 “Action” 或 “Final Answer”。
-            4. 除了回答领导的问题，根据提供的数据，你还需要附上自己觉得领导会感兴趣的其他问题，领导可能会做出选择并追问。
-            领导从公司数据库中调取了如下信息，并问了如下问题：
-            """
+        # 1. Build lightweight data catalog
+        catalog_text, user_file_ids = build_data_catalog(
+            user_id=user_id, file_id=file_id,
+        )
+        print("Step 1: Built data catalog, length:", len(catalog_text))
+        print("--------------------------------")
 
+        if not catalog_text:
+            return {
+                "answer": "当前用户下暂无可查询数据，请先上传并处理 Excel 文件。",
+                "generatedFiles": [],
+            }
 
-            # Create Pandas Agent
-            # allow_dangerous_code=True is required, because we want to let AI write Python code to calculate data
-            agent = create_pandas_dataframe_agent(
-                llm, 
-                df, 
-                verbose=True, 
-                allow_dangerous_code=True,
-                prefix=my_instruction,
-                agent_executor_kwargs={"handle_parsing_errors": custom_error_handler}
-                # agent_executor_kwargs={"handle_parsing_errors": True}
-            )
-            # Execute analysis
-            response = agent.invoke(question)
-            return {"answer": response["output"]}
+        # 2. Build prompt (small: question + history + catalog only)
+        prompt = (
+            "你是一个经验丰富的营销分析师。\n"
+            "请严格遵守以下要求：\n"
+            "1) 严格使用中文回答。\n"
+            "2) 先使用 query_data 工具查询所需数据，再基于查询结果进行分析。不要凭空猜测数据。\n"
+            "3) 如果问题比较模糊或探索性的，可以使用 vector_search 工具进行语义搜索。\n"
+            "4) 当用户需要可视化对比、趋势或分布等数据时，请调用 generate_chart 工具生成图表。\n"
+            "5) 当用户需要可导出的数据表格时，请调用 generate_csv 工具生成 CSV 文件。\n"
+            "6) 回答结构尽量清晰：先给结论，再给关键依据（可用要点列出）。\n"
+            "7) 生成图表或文件时，标题和文件名必须使用中文，不要使用英文或拼音。\n"
+            "8) 生成图表或文件时，仍需在文字回答中包含分析结论和关键发现。\n\n"
+            f"该用户可查询的数据（调用 query_data 工具时，sheet_name 和 columns 参数可以从以下目录中选取）:\n{catalog_text}\n\n"
+            f"历史对话:\n{history_text or '无'}\n\n"
+            f"用户问题: {question}\n"
+        )
+        print("Step 2: Built prompt, length:", len(prompt))
+        print("--------------------------------")
 
-        # === Scenario B: PDF knowledge base question answering (RAG) ===
-        elif current_type == "pdf":
-            vector_store = GLOBAL_CONTEXT["vector_store"]
-            retriever = vector_store.as_retriever(search_kwargs={"k": 3}) # find the most relevant 3 chunks
+        # 3. Build tools and invoke LLM
+        tools = build_tools(
+            user_id=user_id,
+            chat_id=chat_id,
+            embedding_function=embedding_function,
+            user_file_ids=user_file_ids,
+        )
+        llm_with_tools = llm.bind_tools(tools)
+        tool_map = {t.name: t for t in tools}
 
-            # Define Prompt (tell AI its role)
-            prompt = ChatPromptTemplate.from_template("""
-            你是一个企业助手。请根据下面的上下文回答用户的问题。
-            如果上下文中没有答案，就诚实地说不知道，不要编造。
-            
-            <history>
-            {history}
-            </history>
+        messages_chain = [HumanMessage(content=prompt)]
+        ai_msg = llm_with_tools.invoke(messages_chain)
+        generated_file_ids: list[str] = []
 
-            <context>
-            {context}
-            </context>
+        max_tool_rounds = 8
+        rounds = 0
+        while ai_msg.tool_calls and rounds < max_tool_rounds:
+            rounds += 1
+            tool_names = [tc["name"] for tc in ai_msg.tool_calls]
+            print(f"Step 3.{rounds}: Executing tool call(s): {tool_names}")
+            print("--------------------------------")
+            messages_chain.append(ai_msg)
+            for tc in ai_msg.tool_calls:
+                try:
+                    result = tool_map[tc["name"]].invoke(tc["args"])
+                except Exception as tool_err:
+                    logger.exception("tool_call_failed tool=%s", tc["name"])
+                    result = json.dumps(
+                        {"error": f"工具调用失败: {str(tool_err)}"},
+                        ensure_ascii=False,
+                    )
+                messages_chain.append(
+                    ToolMessage(content=str(result), tool_call_id=tc["id"])
+                )
+                try:
+                    result_data = json.loads(result) if isinstance(result, str) else result
+                    if isinstance(result_data, dict) and "fileId" in result_data:
+                        generated_file_ids.append(result_data["fileId"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            ai_msg = llm_with_tools.invoke(messages_chain)
 
-            用户问题: {input}
-            """)
+        answer = extract_llm_text(ai_msg)
+        answer_log = answer if len(answer) <= 1000 else answer[:1000] + "...[truncated]"
+        print("Step 4: Final answer:", answer_log)
+        print("--------------------------------")
 
-            # 构建 RAG 链 (检索 -> 注入 Prompt -> LLM)
-            document_chain = create_stuff_documents_chain(llm, prompt)
-            retrieval_chain = create_retrieval_chain(retriever, document_chain)
+        generated_files = fetch_generated_files(generated_file_ids) if generated_file_ids else []
 
-            # 执行问答
-            response = retrieval_chain.invoke({"input": question, "history": history_text or "无"})
-            return {"answer": response["answer"]}
-
-    except Exception as e:
-        print(f"❌ AI Error: {str(e)}")
-        return {"answer": f"抱歉，我思考时遇到了错误: {str(e)}"}
-
-
-
-
-
+        return {
+            "answer": answer,
+            "generatedFiles": generated_files,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("chat_failed user_id=%s file_id=%s error=%s", user_id, file_id, str(exc))
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(exc)}")
