@@ -1,0 +1,35 @@
+---
+description: Preserve Chinese text correctness in prompts and persisted strings
+alwaysApply: true
+---
+
+# Chinese Text Encoding Safety
+
+This project serves Chinese users. For code involving LLM prompts, string processing, and text persistence, always preserve Chinese characters end-to-end.
+
+## Required Practices
+
+- Use UTF-8 explicitly for file I/O (`encoding="utf-8"`).
+- Serialize JSON with `ensure_ascii=False` to keep readable Chinese text.
+- Keep storage and transport layers Unicode-safe (e.g., DB collation/charset supports Chinese such as `utf8mb4`).
+- Avoid transformations that can corrupt characters (incorrect encoding decode/encode cycles).
+
+## Examples
+
+```python
+# ❌ BAD: may escape Chinese, harder to debug/review
+with open("prompt.json", "w") as f:
+    json.dump({"prompt": "请总结以下内容"}, f)
+
+# ✅ GOOD: preserve readable Chinese characters
+with open("prompt.json", "w", encoding="utf-8") as f:
+    json.dump({"prompt": "请总结以下内容"}, f, ensure_ascii=False)
+```
+
+```python
+# ❌ BAD: platform-default encoding can cause corruption
+text = open("template.txt").read()
+
+# ✅ GOOD: explicit UTF-8 decode
+text = open("template.txt", encoding="utf-8").read()
+```
