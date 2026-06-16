@@ -1,20 +1,46 @@
-# SME Data Brain (FastAPI)
+# SME Data Brain
 
-Excel-first RAG + structured-query service with LLM tool calling.
+AI analysis service for the SME product. It ingests uploaded Excel files, builds structured and semantic retrieval layers, answers business questions, and generates charts or CSV outputs.
 
-## Architecture
+## What This Service Does
 
-The service uses an **agent-driven** approach: the LLM receives a lightweight data catalog (sheet names, columns, types) and decides which tools to call to answer each question.
+`sme-databrain` is the data and LLM execution layer of the system. It receives ingestion requests from `sme-backend`, turns spreadsheets into queryable structures, and uses tool-calling to answer natural-language questions with text, charts, and exports.
 
-**Available tools:**
-- `query_data` -- structured SQL queries against Excel row data (SheetRow table)
-- `vector_search` -- semantic similarity search over text chunks (fallback for exploratory questions)
-- `generate_chart` -- bar/line/pie chart generation via matplotlib
-- `generate_csv` -- CSV file export
+## Core Features
 
-## Commands
+- Excel ingestion into structured sheet metadata and row records
+- Text chunking and embedding generation for semantic retrieval
+- Tool-based question answering over uploaded business data
+- SQL-style querying against normalized row storage
+- Vector search fallback for exploratory questions
+- Chart generation with PNG output
+- CSV export generation
+- Generated file metadata persistence
 
-Install dependencies (first time):
+## Tech Stack
+
+- FastAPI
+- Python 3.11+
+- Pandas + OpenPyXL
+- PostgreSQL + psycopg
+- Sentence Transformers
+- LangChain
+- Gemini via `langchain-google-genai`
+- Matplotlib
+
+## Main API Endpoints
+
+### `POST /context/load`
+
+Ingest an uploaded Excel file into structured and semantic storage.
+
+### `POST /chat`
+
+Run an agent-style analysis round. The LLM receives a lightweight data catalog and chooses tools such as `query_data`, `vector_search`, `generate_chart`, and `generate_csv`.
+
+## Local Development
+
+Create a virtual environment and install dependencies:
 
 ```bash
 python3 -m venv .venv
@@ -22,88 +48,53 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Run the project locally:
+Run the service:
 
 ```bash
 source .venv/bin/activate
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Purge all uploaded and generated files (disk + database):
+Default local URL:
 
-```bash
-bash migration/purge_all_files.sh
+```text
+http://localhost:8000
 ```
 
 ## Environment Variables
 
-- `GOOGLE_API_KEY`: Gemini API key
-- `DATABASE_URL`: PostgreSQL connection string
-- `EMBEDDING_MODEL`: defaults to `all-MiniLM-L6-v2`
-- `MAX_EXCEL_FILE_MB`: defaults to `25`
-- `MAX_ROWS_PER_SHEET`: defaults to `10000`
-- `EXCEL_CHUNK_SIZE`: defaults to `40`
-- `EXCEL_CHUNK_OVERLAP`: defaults to `8`
-- `GENERATED_FILES_DIR`: directory for LLM-generated charts and data files (default: `/Users/xiaoyuyin/Desktop/YXY_DEV/SME/sme-backend/generats`)
+Typical local `.env`:
 
-## API
-
-### POST `/context/load`
-
-Synchronous file ingestion. Parses Excel into:
-1. Text chunks + vector embeddings (for `vector_search`)
-2. Structured SheetMeta + SheetRow records (for `query_data`)
-
-Request body:
-
-```json
-{
-  "fileId": "backend-datafile-id",
-  "filepath": "/absolute/path/to/file.xlsx",
-  "mimeType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-}
+```bash
+GOOGLE_API_KEY=your_gemini_key
+DATABASE_URL=postgresql://admin:password123@localhost:5432/sme_db
+EMBEDDING_MODEL=all-MiniLM-L6-v2
+MAX_EXCEL_FILE_MB=25
+MAX_ROWS_PER_SHEET=10000
+EXCEL_CHUNK_SIZE=40
+EXCEL_CHUNK_OVERLAP=8
+GENERATED_FILES_DIR=/absolute/path/to/sme-backend/generats
 ```
 
-### POST `/chat`
+## Useful Commands
 
-Agent-driven chat. The LLM receives a data catalog and decides which tools to call.
-
-Request body:
-
-```json
-{
-  "userId": "backend-user-id",
-  "fileId": "optional-backend-datafile-id",
-  "chatId": "optional-chat-session-id",
-  "message": "这个月销量最好的产品是什么？",
-  "history": []
-}
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+bash migration/purge_all_files.sh
 ```
 
-Response body:
+## Managed Data
 
-```json
-{
-  "answer": "根据数据分析...",
-  "generatedFiles": [
-    {
-      "id": "uuid",
-      "fileType": "chart",
-      "mimeType": "image/png",
-      "filename": "uuid_销售分析图.png",
-      "path": "/path/to/file.png",
-      "size": 12345
-    }
-  ]
-}
-```
+This service writes or maintains records related to:
 
-## Database Tables
+- `SheetMeta`
+- `SheetRow`
+- `GeneratedFile`
+- semantic chunks / embeddings produced during ingestion
 
-### Managed by this service (raw SQL):
-- `SheetMeta` -- per-sheet metadata catalog (columns, types, row counts)
-- `SheetRow` -- structured row data as JSONB
-- `GeneratedFile` -- LLM-generated file records
+## Service Relationships
 
-### Managed by sme-backend (Prisma):
-- `DataFile`, `Document`, `Chunk`, `Embedding`, `RAGIngestionRun`
+- Receives ingestion and chat requests from `sme-backend`
+- Stores analysis artifacts in PostgreSQL
+- Writes generated charts/files into a directory served by `sme-backend`
+- Is not directly called by the browser
