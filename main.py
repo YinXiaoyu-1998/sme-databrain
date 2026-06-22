@@ -8,10 +8,10 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, ToolMessage
 from dotenv import load_dotenv
 
+from llm_factory import build_llm
 from schemas import LoadContextRequest, ChatRequest
 from utils import (
     chunk_excel_file,
@@ -31,14 +31,7 @@ logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-pro",
-    # model="gemini-3-pro-preview",
-    # model="gemini-pro-latest",
-    temperature=0,
-    max_retries=2,
-    transport="rest",
-)
+llm = build_llm()
 
 embedding_model_name = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 embedding_function = HuggingFaceEmbeddings(model_name=embedding_model_name)
