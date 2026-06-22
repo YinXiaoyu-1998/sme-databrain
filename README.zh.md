@@ -25,7 +25,7 @@
 - PostgreSQL + psycopg
 - Sentence Transformers
 - LangChain
-- Gemini（通过 `langchain-google-genai`）
+- OpenAI-compatible 聊天模型（通过 `langchain-openai`）
 - Matplotlib
 
 ## 主要接口
@@ -66,8 +66,11 @@ http://localhost:8000
 本地常见 `.env` 配置：
 
 ```bash
-GOOGLE_API_KEY=your_gemini_key
 DATABASE_URL=postgresql://admin:password123@localhost:5432/sme_db
+LLM_PROVIDER=openai-compatible
+LLM_MODEL=qwen3.6-plus
+OPENAI_COMPATIBLE_API_KEY=your_llm_api_key
+OPENAI_COMPATIBLE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 MAX_EXCEL_FILE_MB=25
 MAX_ROWS_PER_SHEET=10000
@@ -75,6 +78,10 @@ EXCEL_CHUNK_SIZE=40
 EXCEL_CHUNK_OVERLAP=8
 GENERATED_FILES_DIR=/absolute/path/to/sme-backend/generats
 ```
+
+Qwen/DashScope 通过上面的 OpenAI-compatible 变量接入。要切换到其他
+OpenAI-compatible 服务，只需要替换 `LLM_MODEL`、`OPENAI_COMPATIBLE_API_KEY`
+和 `OPENAI_COMPATIBLE_BASE_URL`。
 
 ## 常用命令
 

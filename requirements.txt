@@ -16,4 +16,3 @@ chromadb  # 向量数据库
 sentence-transformers # 开源的 embedding 模型
 psycopg[binary]
 matplotlib  # 图表生成
-langchain-google-genai  # Gemini LLM 集成
